@@ -82,6 +82,10 @@ const FN_ARITY={0:f=>()=>f(),1:f=>a=>f(a),2:f=>(a,b)=>f(a,b),3:f=>(a,b,c)=>f(a,b
 function regFn(database,name,fn,arities){arities.forEach(n=>database.create_function(name,FN_ARITY[n](fn)));}
 function registerFunctions(database){
  registerFunctionsMath(database);registerFunctionsText(database);
+ /* A validátor a sémából tudja megkülönböztetni a valódi oszlopnevet a puszta
+    álnévtől (pl. `FORMAT(`ar`,2) AS `ar`` a `italok` táblán nem hiba, mert a
+    WHERE a valódi `ar` oszlopot látja). Ezért minden inicializáláskor frissítjük. */
+ MYSQL_DB=database;mysqlRegisterSchema(database);
 }
 /* Matematikai függvények – MySQL 9 szemantikával. */
 function registerFunctionsMath(database){
@@ -148,9 +152,151 @@ function preprocessTrim(q){return q.replace(/\bTRIM\s*\(\s*(?:(LEADING|TRAILING|
  * Oktatási szabályellenőrzés – tipikus kezdőhibák felismerése futtatás előtt,
  * hogy a tanuló magyar magyarázatot kapjon a nyers SQLite-hiba helyett.
  * Visszatérés: null, vagy {type:'sql'|'logical', message:string}
+ *
+ * FONTOS: a sql.js (SQLite) megenged olyat, amit a MySQL nem. A legfontosabb
+ * példa a SELECT-álnév használata a WHERE-ben:
+ *
+ *     SELECT `nev`, `netto` * (1 + `afa`) AS `brutto`   -- MySQL: 1054 hiba
+ *     FROM `termekek` WHERE `brutto` > 400;             -- SQLite: lefut!
+ *
+ * A MySQL-ben a WHERE előbb fut le, mint hogy az álnév létrejönne, ezért ott
+ * "Unknown column in 'where clause'" a válasz. Mivel az SQLite csendben
+ * lefuttatja, a hibát itt kell elkapni – különben a tanuló rossz SQL-t tanul.
  * ========================================================================= */
 
-function mysqlValidate(sql){const s=sql.replace(/--.*$/gm,' ').replace(/\s+/g,' ').trim();const w=(s.match(/\bWHERE\b([\s\S]*?)(?:\bORDER\s+BY\b|\bGROUP\s+BY\b|\bLIMIT\b|$)/i)||[])[1]||'';if(/\b(SUM|AVG|MIN|MAX|COUNT)\s*\(/i.test(w))return {type:'sql',message:'Az összesítő függvény nem használható a WHERE záradékban.'};const aliases=[...s.matchAll(/\bAS\s+`([^`]+)`/gi)].map(m=>m[1]);for(const a of aliases){if(new RegExp('`'+a.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'`','i').test(w))return {type:'sql',message:'A SELECT-listában létrehozott álnév nem használható ugyanennek a lekérdezésnek a WHERE részében.'};}if(/\bORDER\s+BY\s+'[^']+'/i.test(s))return {type:'logical',message:'Az ORDER BY aposztrófos szövegkonstanst kapott, nem oszlopazonosítót. Használj backticket.'};if(/\b(SUBSTRING|SUBSTR|MID)\s*\(\s*(?:'[^']*'|`[^`]+`)\s*,\s*0\s*[,)]/i.test(s))return {type:'logical',message:'A MySQL-ben a szöveg pozíciója 1-től indul, ezért a 0 kezdőpozíció üres eredményt ad. Az első karakterhez 1-et írj.'};if(/\bFORMAT\s*\([^()]*\)\s*(?:>=|<=|>|<|=)\s*-?\d/i.test(s))return {type:'logical',message:'A FORMAT() szöveget ad vissza, ezért számként nem hasonlítható össze. A WHERE feltételben a nyers számértéket használd.'};if(/\b(SUM|AVG|MIN|MAX|COUNT)\s*\([^)]*\)\s*[+*\/-]\s*\([^)]*`[^`]+`[^)]*\)/i.test(s)&&!/\bGROUP\s+BY\b/i.test(s))return {type:'sql',message:'Az összesítő függvény eredménye mellett nem használható nem összesített mező GROUP BY nélkül. Tedd a teljes soronkénti kifejezést az összesítő függvény belsejébe.'};if(/\bSELECT\b[\s\S]*?\b(SUM|AVG|MIN|MAX|COUNT)\s*\([^)]*\)[\s\S]*?\bFROM\b/i.test(s)&&!/\bGROUP\s+BY\b/i.test(s)){const select=(s.match(/\bSELECT\b([\s\S]*?)\bFROM\b/i)||[])[1]||'';const stripped=select.replace(/\b(SUM|AVG|MIN|MAX|COUNT)\s*\([^)]*\)/gi,'').replace(/\bROUND\s*\([^)]*\)/gi,'').replace(/\bAS\s+`[^`]+`/gi,'').replace(/[\s,0-9.+*()'-]/g,'');if(/`[^`]+`|\b[a-z_][a-z0-9_]*\b/i.test(stripped))return {type:'sql',message:'Aggregált lekérdezésben GROUP BY nélkül nem szerepelhet nem összesített oszlop a SELECT-listában.'};}return null;}
+/* A regisztrált adatbázis és a belőle kiolvasott séma. A sémára azért van
+   szükség, hogy meg tudjuk különböztetni a valódi oszlopnevet a puszta
+   álnévtől: a MySQL a WHERE-ben a valódi oszlopot használja, ha van ilyen. */
+let MYSQL_DB=null;
+let MYSQL_SCHEMA=null;
+
+function mysqlRegisterSchema(database){
+  const src=database||MYSQL_DB;
+  const map=new Map();
+  try{
+    if(src){
+      const r=src.exec("SELECT name FROM sqlite_master WHERE type IN ('table','view')")[0];
+      if(r)r.values.forEach(row=>{
+        const raw=String(row[0]), cols=new Set();
+        try{
+          const info=src.exec('PRAGMA table_info(`'+raw.replace(/`/g,'``')+'`)')[0];
+          if(info)info.values.forEach(c=>cols.add(String(c[1]).toLowerCase()));
+        }catch(e){}
+        map.set(raw.toLowerCase(),cols);
+      });
+    }
+  }catch(e){}
+  MYSQL_SCHEMA=map.size?map:null;
+  return MYSQL_SCHEMA;
+}
+
+/* Azok a szavak, amelyeket soha nem tekintünk oszlopnévnek. */
+const MYSQL_SQL_WORDS=new Set(['and','or','not','is','null','like','between','in','exists','where','order','by','group','having','limit','asc','desc','true','false','div','mod','binary','collate','case','when','then','else','end','distinct','all','any','some','on','using','join','inner','left','right','full','cross','union','select','from','as','set','interval','escape','regexp','rlike','xor','values','into','dual']);
+
+/* A WHERE záradék a szövegben elfoglalt HELYÉVEL együtt, hogy a lekérdezés
+   többi részét pontosan le tudjuk választani (a szövegkonstansok miatt
+   a keresés-szövegre nem lehet támaszkodni). */
+function mysqlWhereClause(s){
+  const m=/\bWHERE\b([\s\S]*?)(?:\bGROUP\s+BY\b|\bHAVING\b|\bORDER\s+BY\b|\bLIMIT\b|$)/i.exec(s);
+  if(!m)return {text:'',from:-1,to:-1};
+  const from=m.index+m[0].length-m[1].length;
+  return {text:m[1],from:from,to:from+m[1].length};
+}
+
+/* A SELECT-lista szövege (a legelső SELECT és a hozzá tartozó FROM között). */
+function mysqlSelectList(s){return (s.match(/\bSELECT\b([\s\S]*?)\bFROM\b/i)||[])[1]||'';}
+
+/* A szövegkonstansok kivétele, hogy a bennük lévő szavak ne számítsanak
+   azonosítónak (pl. WHERE `nev` = 'brutto' esetén ne legyen téves találat). */
+function mysqlStripStrings(t){return String(t||'').replace(/'(?:[^'\\]|\\.|'')*'/g,' ');}
+
+/* Azonosítók egy szövegrészben – backtickes és csupasz alak is, kisbetűsen. */
+function mysqlIdentifiers(text){
+  const out=[];
+  mysqlStripStrings(text).replace(/`([^`]+)`|[A-Za-z_$][\w$]*/g,(m,bt)=>{out.push(String(bt===undefined?m:bt).toLowerCase());return m;});
+  return out;
+}
+
+/* A lekérdezésben szereplő táblák nevei (FROM / JOIN után). */
+function mysqlReferencedTables(s){
+  const out=[], re=/\b(?:FROM|JOIN)\s+(`[^`]+`|[A-Za-z_$][\w$]*)/gi;
+  let m;
+  while((m=re.exec(s))){
+    const n=m[1].replace(/`/g,'').toLowerCase();
+    if(!MYSQL_SQL_WORDS.has(n)&&!out.includes(n))out.push(n);
+  }
+  return out;
+}
+
+/* A SELECT-listában létrehozott MEZŐálnevek. A táblaálneveket (FROM / JOIN
+   után) kihagyjuk, mert azok a WHERE-ben jogosan használhatók. */
+function mysqlColumnAliases(s){
+  const names=new Set(), list=mysqlSelectList(s), re=/\bAS\s+(`[^`]+`|[A-Za-z_$][\w$]*)/gi;
+  let m;
+  while((m=re.exec(list)))names.add(m[1].replace(/`/g,'').toLowerCase());
+  if(!names.size)return [];
+  mysqlReferencedTables(s).forEach(t=>names.delete(t));
+  return [...names];
+}
+
+/* Igaz, ha a név valódi oszlop a lekérdezésben szereplő valamelyik táblában.
+   Ilyenkor a MySQL a WHERE-ben az OSZLOPOT használja, nem az álnevet, tehát
+   nincs hiba (pl. `SELECT FORMAT(`ar`,2) AS `ar` FROM `italok` WHERE `ar`>100`). */
+function mysqlIsRealColumnOf(s,name){
+  if(!MYSQL_SCHEMA&&MYSQL_DB)mysqlRegisterSchema(MYSQL_DB);
+  if(!MYSQL_SCHEMA)return false;
+  return mysqlReferencedTables(s).some(t=>{const c=MYSQL_SCHEMA.get(t);return !!(c&&c.has(name));});
+}
+
+/* MySQL-hiba, amit az SQLite nem jelez: SELECT-álnév a WHERE-ben.
+   Csak akkor jelezzük, ha a név tényleg álnevű: a lekérdezés más részén
+   (a WHERE-n és az AS-fejlécen kívül) nem szerepel valódi oszlopként.
+   Így a `SELECT `nev` AS `nev` ... WHERE `nev` = 'x'` eset nem téves riasztás. */
+function mysqlAliasInWhere(s){
+  const wc=mysqlWhereClause(s);
+  if(!wc.text)return null;
+  /* Altáblakérdésnél és UNION-nál a záradékok hatóköre különválik, a puszta
+     szövegelemzés itt téves riasztást adhatna, ezért ilyenkor nem ellenőrzünk.
+     A tananyag egyik mintája sem használ ilyet. */
+  if(/\(\s*SELECT\b/i.test(s)||/\bUNION\b/i.test(s))return null;
+  const aliases=mysqlColumnAliases(s);
+  if(!aliases.length)return null;
+  // a `t`.`oszlop` és a t.oszlop alak mindig valódi oszlop, ezért kivesszük
+  const bare=mysqlStripStrings(wc.text)
+    .replace(/`[^`]*`\s*\.\s*(?:`[^`]*`|[A-Za-z_$][\w$]*)/g,' ')
+    .replace(/[A-Za-z_$][\w$]*\s*\.\s*(?:`[^`]*`|[A-Za-z_$][\w$]*)/g,' ');
+  const used=new Set(mysqlIdentifiers(bare).filter(id=>!MYSQL_SQL_WORDS.has(id)));
+  if(!used.size)return null;
+  // a lekérdezés WHERE-n kívüli része, az AS-fejlécek nélkül
+  const rest=mysqlStripStrings(s.slice(0,wc.from)+' '+s.slice(wc.to))
+    .replace(/\bAS\s+(?:`[^`]+`|[A-Za-z_$][\w$]*)/gi,' ');
+  const real=new Set(mysqlIdentifiers(rest));
+  for(const a of aliases){
+    if(!used.has(a))continue;
+    if(real.has(a))continue;               // máshol valódi oszlopként szerepel
+    if(mysqlIsRealColumnOf(s,a))continue;  // van ilyen oszlop a forrástáblában
+    return {type:'sql',message:'A SELECT-listában létrehozott álnév nem használható ugyanennek a lekérdezésnek a WHERE részében. A WHERE ugyanis előbb fut le, mint hogy az álnév létrejönne (MySQL: 1054 ismeretlen oszlop). Írd ki a teljes kifejezést a WHERE feltételébe.'};
+  }
+  return null;
+}
+
+function mysqlValidate(sql){
+  const s=String(sql||'').replace(/--.*$/gm,' ').replace(/\s+/g,' ').trim();
+  const w=mysqlWhereClause(s).text;
+  if(/\b(SUM|AVG|MIN|MAX|COUNT)\s*\(/i.test(w))return {type:'sql',message:'Az összesítő függvény nem használható a WHERE záradékban.'};
+  const aliasIssue=mysqlAliasInWhere(s);
+  if(aliasIssue)return aliasIssue;
+  if(/\bORDER\s+BY\s+'[^']+'/i.test(s))return {type:'logical',message:'Az ORDER BY aposztrófos szövegkonstanst kapott, nem oszlopazonosítót. Használj backticket.'};
+  if(/\b(SUBSTRING|SUBSTR|MID)\s*\(\s*(?:'[^']*'|`[^`]+`)\s*,\s*0\s*[,)]/i.test(s))return {type:'logical',message:'A MySQL-ben a szöveg pozíciója 1-től indul, ezért a 0 kezdőpozíció üres eredményt ad. Az első karakterhez 1-et írj.'};
+  if(/\bFORMAT\s*\([^()]*\)\s*(?:>=|<=|>|<|=)\s*-?\d/i.test(s))return {type:'logical',message:'A FORMAT() szöveget ad vissza, ezért számként nem hasonlítható össze. A WHERE feltételben a nyers számértéket használd.'};
+  if(/\b(SUM|AVG|MIN|MAX|COUNT)\s*\([^)]*\)\s*[+*\/-]\s*\([^)]*`[^`]+`[^)]*\)/i.test(s)&&!/\bGROUP\s+BY\b/i.test(s))return {type:'sql',message:'Az összesítő függvény eredménye mellett nem használható nem összesített mező GROUP BY nélkül. Tedd a teljes soronkénti kifejezést az összesítő függvény belsejébe.'};
+  if(/\bSELECT\b[\s\S]*?\b(SUM|AVG|MIN|MAX|COUNT)\s*\([^)]*\)[\s\S]*?\bFROM\b/i.test(s)&&!/\bGROUP\s+BY\b/i.test(s)){
+    const select=mysqlSelectList(s);
+    const stripped=select.replace(/\b(SUM|AVG|MIN|MAX|COUNT)\s*\([^)]*\)/gi,'').replace(/\bROUND\s*\([^)]*\)/gi,'').replace(/\bAS\s+`[^`]+`/gi,'').replace(/[\s,0-9.+*()'-]/g,'');
+    if(/`[^`]+`|\b[a-z_][a-z0-9_]*\b/i.test(stripped))return {type:'sql',message:'Aggregált lekérdezésben GROUP BY nélkül nem szerepelhet nem összesített oszlop a SELECT-listában.'};
+  }
+  return null;
+}
 
 /* =========================================================================
  * Szintaxiskiemelés a tananyag CSS-osztályaival:
