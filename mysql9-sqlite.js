@@ -3059,6 +3059,120 @@
     return out;
   }
 
+  /* MySQL-ben a HAVING összesítés és GROUP BY nélkül is megengedett: a SELECT
+     után fut le, ezért a SELECT-álneveket is ismeri. Az SQLite ilyenkor
+     „HAVING clause on a non-aggregate query” hibát dob, ezért a HAVING-et
+     WHERE-re alakítjuk, és az álneveket a mögöttes kifejezésre cseréljük. */
+  function rewriteLooseHaving(sql) {
+    const source = String(sql == null ? '' : sql);
+    if (!/\bHAVING\b/i.test(source)) return source;
+    const tokens = codeTokens(source);
+    if (!tokens.length || tokens[0].word !== 'SELECT') return source;
+
+    /* Zárójelmélység tokenenként: csak a legfelső szint számít. */
+    const depths = [];
+    let depth = 0;
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i].word === ')') depth = Math.max(0, depth - 1);
+      depths.push(depth);
+      if (tokens[i].word === '(') depth++;
+    }
+
+    const havingIdx = tokens.findIndex((t, i) => t.word === 'HAVING' && depths[i] === 0);
+    if (havingIdx < 0) return source;
+    /* Csoportosított lekérdezést és összetett (UNION) lekérdezést az SQLite is
+       kezel, illetve túl kockázatos átírni — ezeket érintetlenül hagyjuk. */
+    for (let i = 0; i < tokens.length; i++) {
+      if (depths[i] !== 0) continue;
+      if (['UNION', 'INTERSECT', 'EXCEPT'].includes(tokens[i].word)) return source;
+      if (tokens[i].word === 'GROUP' && tokens[i + 1] && tokens[i + 1].word === 'BY') return source;
+    }
+    /* Összesítő függvény jelenlétében az SQLite saját maga is lefuttatja. */
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i + 1] && tokens[i + 1].word === '(' && isAggregateWord(tokens[i].word)) return source;
+    }
+
+    const stopWords = new Set(['ORDER', 'LIMIT', 'WINDOW', 'UNION', 'INTERSECT', 'EXCEPT', 'PROCEDURE', 'INTO']);
+    let endIdx = tokens.length;
+    for (let i = havingIdx + 1; i < tokens.length; i++) {
+      if (depths[i] !== 0) continue;
+      if (stopWords.has(tokens[i].word) || tokens[i].text === ';') { endIdx = i; break; }
+    }
+    const condStart = tokens[havingIdx].end;
+    const condEnd = endIdx < tokens.length ? tokens[endIdx].start : source.length;
+    const condition = source.slice(condStart, condEnd).trim();
+    if (!condition) return source;
+
+    /* SELECT-lista elemei: álnevek és a mögöttes kifejezések. */
+    const fromIdx = tokens.findIndex((t, i) => t.word === 'FROM' && depths[i] === 0);
+    const listEnd = fromIdx >= 0 && fromIdx < havingIdx ? fromIdx : havingIdx;
+    const aliasMap = new Map();
+    const ranges = [];
+    let partStart = 1;
+    while (partStart < listEnd && ['DISTINCT', 'ALL', 'DISTINCTROW'].includes(tokens[partStart].word)) partStart++;
+    for (let i = partStart; i <= listEnd; i++) {
+      const atEnd = i === listEnd;
+      if (!atEnd && !(tokens[i].text === ',' && depths[i] === 0)) continue;
+      if (i > partStart) ranges.push({ start: partStart, end: i });
+      partStart = i + 1;
+    }
+    for (const range of ranges) {
+      const last = tokens[range.end - 1];
+      const before = tokens[range.end - 2];
+      if (!last || !before) continue;
+      /* Az áljel mindig a lista utolsó tokenje; az előtte lévő kifejezés
+         záró tokenje AS esetén kettővel, egyébként eggyel korábbi. */
+      let alias = null, exprLast = range.end - 2;
+      if (before.word === 'AS' && isAtomToken(last)) {
+        alias = unquoteName(last.text);
+        exprLast = range.end - 3;
+      } else if (isAtomToken(last) && before.text !== '.' &&
+        (isAtomToken(before) || before.word === ')' || before.word === 'END') &&
+        last.start > before.end) {
+        alias = unquoteName(last.text);
+      }
+      if (!alias || exprLast < range.start) continue;
+      const expr = source.slice(tokens[range.start].start, tokens[exprLast].end).trim();
+      if (expr && !aliasMap.has(alias.toLowerCase())) aliasMap.set(alias.toLowerCase(), expr);
+    }
+
+    /* Álnevek helyettesítése a feltételben a mögöttes kifejezéssel. */
+    let expanded = condition;
+    if (aliasMap.size) {
+      const condTokens = tokenize(condition);
+      const edits = [];
+      for (let i = 0; i < condTokens.length; i++) {
+        const t = condTokens[i];
+        if (!isAtomToken(t)) continue;
+        if (condTokens[i - 1] && condTokens[i - 1].word === '.') continue;
+        if (condTokens[i + 1] && condTokens[i + 1].word === '.') continue;
+        if (condTokens[i + 1] && condTokens[i + 1].word === '(') continue;
+        const expr = aliasMap.get(unquoteName(t.text).toLowerCase());
+        if (!expr) continue;
+        edits.push({ start: t.start, end: t.end, text: '(' + expr + ')' });
+      }
+      expanded = applyEdits(condition, edits);
+    }
+
+    const whereIdx = tokens.findIndex((t, i) => t.word === 'WHERE' && depths[i] === 0);
+    const edits = [];
+    if (whereIdx >= 0 && whereIdx < havingIdx) {
+      /* Van már WHERE: AND-del hozzáfűzzük, a HAVING-et pedig töröljük. */
+      let insertIdx = havingIdx;
+      for (let i = whereIdx + 1; i < havingIdx; i++) {
+        if (depths[i] !== 0) continue;
+        if (['GROUP', 'ORDER', 'LIMIT', 'WINDOW'].includes(tokens[i].word)) { insertIdx = i; break; }
+      }
+      const insertAt = tokens[insertIdx].start;
+      edits.push({ start: insertAt, end: insertAt, text: ' AND (' + expanded + ') ' });
+      edits.push({ start: tokens[havingIdx].start, end: condEnd, text: '' });
+    } else {
+      edits.push({ start: tokens[havingIdx].start, end: tokens[havingIdx].end, text: 'WHERE' });
+      edits.push({ start: condStart, end: condEnd, text: ' ' + expanded + ' ' });
+    }
+    return applyEdits(source, edits);
+  }
+
   /* =======================================================================
    * 8. Utasítás-szintű átírások: DDL, DML, adminisztratív parancsok
    * ===================================================================== */
@@ -3528,6 +3642,7 @@
     if (/^\s*(?:INSERT|REPLACE)\b/i.test(out)) out = rewriteInsert(out);
     if (/^\s*(?:UPDATE|DELETE)\b/i.test(out)) out = rewriteRowLimit(out);
     out = rewriteIntervals(out);
+    out = rewriteLooseHaving(out);
     out = rewriteCast(out);
     out = rewriteTrim(out);
     out = rewriteGroupConcat(out);
@@ -4298,8 +4413,29 @@
         }
       }
       for (const part of parts) {
+        const span = tokens.slice(part.start, part.end)
+          .filter(t => !['ASC', 'DESC', 'NULLS', 'FIRST', 'LAST'].includes(t.word))
+          .filter(t => t.text !== ';' && t.text !== ',');
+        if (!span.length) continue;
+        /* GROUP BY sorszám (pl. GROUP BY 1): a SELECT-lista adott elemére utal. */
+        if (span.length === 1 && /^\d+$/.test(span[0].text)) {
+          const pos = parseInt(span[0].text, 10);
+          if (pos >= 1 && pos <= infos.length) groupRefs.push(...infos[pos - 1].refs);
+          continue;
+        }
         const refs = inspectExpression(tokens, part.start, part.end).refs;
-        if (refs.length === 1 && part.end - part.start <= 3) groupRefs.push(refs[0]);
+        /* GROUP BY álnév (pl. GROUP BY k): a SELECT-lista álnévhez tartozó
+           kifejezés csoportosít, nem egy k nevű oszlop. A valódi oszlopnév
+           elsőbbséget élvez, ahogy a MySQL-ben is. */
+        if (refs.length === 1 && !refs[0].qualifier) {
+          const aliasIndex = items.findIndex(it => it.alias && it.alias === refs[0].name);
+          const realColumn = tableInfo.some(i => i.columns.has(refs[0].name));
+          if (aliasIndex >= 0 && !realColumn) {
+            groupRefs.push(...infos[aliasIndex].refs);
+            continue;
+          }
+        }
+        groupRefs.push(...refs);
       }
     }
     /* A WHERE-ben fixált oszlopok is meghatározzák a csoportot. */
@@ -4397,10 +4533,16 @@
       else if (text[0] === '`' || text[0] === '[') cls = 'ident';
       else if (/^(?:0x[\da-f]+|\d)/i.test(text)) cls = 'num';
       else if (HIGHLIGHT_KEYWORDS.has(token.word)) cls = 'kw';
-      else if (nextCodeIsParen(tokens, i)) cls = 'fn';
+      /* Csak név lehet függvénynév: a `*` (1 * 2) vagy a `(` nem. */
+      else if (isIdentifierWord(text) && nextCodeIsParen(tokens, i)) cls = 'fn';
       out.push(cls ? '<span class="' + cls + '">' + escText(text) + '</span>' : escText(text));
     }
     return out.join('');
+  }
+
+  /* Csak akkor lehet függvénynév, ha a token valóban név (nem `*`, `(`, szám). */
+  function isIdentifierWord(text) {
+    return /^[\p{L}_][\p{L}\p{N}_$]*$/u.test(text);
   }
 
   function nextCodeIsParen(tokens, index) {
